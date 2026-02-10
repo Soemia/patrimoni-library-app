@@ -1284,4 +1284,24 @@ Views: {book.views ?? 0} · Download: {book.downloads ?? 0} · Richieste: {book.
 .topbar a { text-decoration: none; }
 .topbar button { padding: 6px 10px; }
 .btnlink { display: inline-block; padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; text-dec
-button:focus, input:focus, select:focus, a:focus { outline: 3px solid; outline-offset: 2px; }
+button:focus, input:focus, select:focus, a:focus { outline: 3px solid; outline-offset: 2px; }# env
+.env
+.env.*
+backend/.env
+frontend/.env
+
+# node
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# build
+dist/
+frontend/dist/
+
+# uploads
+backend/src/uploads/
+uploads/
+
+# misc
+.DS_Store
