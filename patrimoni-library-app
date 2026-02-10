@@ -1,0 +1,1287 @@
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TABLE soemia(
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+email TEXT UNIQUE NOT NULL,
+password_hash TEXT NOT NULL,
+display_name TEXT NOT NULL,
+created_at TIMESTAMP NOT NULL DEFAULT now(),
+location_consent BOOLEAN NOT NULL DEFAULT false,
+location_visibility TEXT NOT NULL DEFAULT 'off' CHECK (location_visibility IN ('off','city','province',
+approx_location GEOGRAPHY(POINT, 4326),
+approx_location_updated_at TIMESTAMP
+);
+CREATE TABLE books (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+owner_id UUID NOT NULL REFERENCES soemia(id) ON DELETE CASCADE,
+title TEXT NOT NULL,
+author TEXT NOT NULL,
+isbn TEXT,
+language TEXT,
+year INT,
+tags TEXT[] DEFAULT '{}',
+visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public','registered','request')),
+lendable BOOLEAN NOT NULL DEFAULT false,
+cover_url TEXT,
+cover_thumb_url TEXT,
+created_at TIMESTAMP NOT NULL DEFAULT now(),
+updated_at TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_books_text ON books
+USING GIN (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(author,'') || ' ' || coalesce(isbn
+CREATE TABLE book_metrics (
+book_id UUID PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+views BIGINT NOT NULL DEFAULT 0,
+detail_opens BIGINT NOT NULL DEFAULT 0,
+downloads BIGINT NOT NULL DEFAULT 0,
+exports BIGINT NOT NULL DEFAULT 0,
+loan_requests BIGINT NOT NULL DEFAULT 0,
+updated_at TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE TABLE loan_requests (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+book_id UUID NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+requester_id UUID NOT NULL REFERENCES soemia(id) ON DELETE CASCADE,
+message TEXT,
+status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected','cancelled')),
+created_at TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_soemia_location ON soemia USING GIST (approx_location);
+{
+"name": "private-library-backend",
+"type": "module",
+"scripts": {
+"dev": "node src/server.js",
+"initdb": "node src/initdb.js"
+},
+"dependencies": {
+"bcrypt": "^5.1.1",
+"cors": "^2.8.5",
+"dotenv": "^16.4.5",
+"express": "^4.19.2",
+"express-rate-limit": "^7.4.0",
+"jsonwebtoken": "^9.0.2",
+"multer": "^1.4.5-lts.1",
+"pdfkit": "^0.15.0",
+"pg": "^8.12.0",
+"sharp": "^0.33.5",
+"zod": "^3.23.8"
+}
+}
+
+PORT=8080
+DATABASE_URL=postgres://app:app@localhost:5432/library
+JWT_SECRET=change_me_super_secret
+CORS_ORIGIN=http://localhost:5173
+UPLOAD_DIR=./src/uploads
+PUBLIC_BASE_URL=http://localhost:8080
+
+import pg from "pg";
+import dotenv from "dotenv";
+dotenv.config();
+export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+export async function query(text, params) {
+const res = await pool.query(text, params);
+return res;
+}
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { query } from "./db.js";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
+await query(schema);
+console.log("DB initialized.");
+process.exit(0);
+
+import jwt from "jsonwebtoken";
+export function authRequired(req, res, next) {
+const header = req.headers.authorization || "";const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+if (!token) return res.status(401).json({ error: "Missing token" });
+try {
+next();
+} catch {
+req.user = jwt.verify(token, process.env.JWT_SECRET);
+return res.status(401).json({ error: "Invalid token" });
+}
+}
+import jwt from "jsonwebtoken";
+export function authOptional(req, _res, next) {
+const header = req.headers.authorization || "";
+const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+if (!token) return next();
+try {
+} catch {
+req.user = jwt.verify(token, process.env.JWT_SECRET);
+// ignore invalid token
+}
+next();
+}
+
+import rateLimit from "express-rate-limit";
+export const limiter = rateLimit({
+windowMs: 60_000,
+max: 120,
+standardHeaders: true,
+legacyHeaders: false
+});
+
+export function validate(schema) {
+return (req, res, next) => {
+const parsed = schema.safeParse({ body: req.body, query: req.query, params: req.params });
+if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+req.validated = parsed.data;
+next();
+};
+}
+
+export function roundCoord(value, decimals = 2) {
+const m = Math.pow(10, decimals);
+return Math.round(value * m) / m;
+export function toPointWKT(lat, lng) {
+return `SRID=4326;POINT(${lng} ${lat})`;
+}
+}
+
+import sharp from "sharp";
+import path from "path";
+import fs from "fs";
+export async function makeThumbnail(inputPath, outputPath) {
+fs.mkdirSync(path.dirname(outputPath), { recursive: true });await sharp(inputPath)
+.resize({ width: 320, withoutEnlargement: true })
+.jpeg({ quality: 82 })
+.toFile(outputPath);
+}
+
+export function canSeeFull(bookVisibility, isLogged) {
+if (bookVisibility === "public") return true;
+if (bookVisibility === "registered") return Boolean(isLogged);
+if (bookVisibility === "request") return false;
+return false;
+}
+export function toLightBook(book) {
+return {
+id: book.id,
+title: book.title,
+author: book.author,
+cover_url: book.cover_url,
+cover_thumb_url: book.cover_thumb_url,
+visibility: book.visibility,
+language: book.language ?? null,
+year: book.year ?? null,
+tags: Array.isArray(book.tags) ? book.tags.slice(0, 5) : [],
+views: book.views ?? 0,
+detail_opens: book.detail_opens ?? 0,
+downloads: book.downloads ?? 0,
+exports: book.exports ?? 0,
+loan_requests: book.loan_requests ?? 0,
+distance_km: typeof book.distance_km === "number" ? Math.round(book.distance_km * 2) / 2 : null
+};
+}
+import express from "express";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import { z } from "zod";
+import { query } from "../db.js";
+import { validate } from "../middleware/validate.js";
+export const authRouter = express.Router();
+const registerSchema = z.object({
+body: z.object({
+email: z.string().email(),
+password: z.string().min(8),
+displayName: z.string().min(2).max(40)
+})
+});
+authRouter.post("/register", validate(registerSchema), async (req, res) => {
+const { email, password, displayName } = req.validated.body;
+const hash = await bcrypt.hash(password, 12);
+try {
+const r = await query(
+"INSERT INTO soemia(email,password_hash,display_name) VALUES ($1,$2,$3) RETURNING id,email,display_na
+[email, hash, displayName]
+);
+} catch {
+return res.json({ user: r.rows[0] });
+return res.status(400).json({ error: "Email già in uso" });
+}
+});
+const loginSchema = z.object({
+body: z.object({
+email: z.string().email(),
+password: z.string().min(1)
+})
+});
+authRouter.post("/login", validate(loginSchema), async (req, res) => {const { email, password } = req.validated.body;
+const r = await query("SELECT id,email,password_hash,display_name FROM soemia WHERE email=$1", [email]);
+if (r.rowCount === 0) return res.status(401).json({ error: "Credenziali non valide" });
+const user = r.rows[0];
+const ok = await bcrypt.compare(password, user.password_hash);
+if (!ok) return res.status(401).json({ error: "Credenziali non valide" });
+const token = jwt.sign({ sub: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "7d" }
+return res.json({ token, user: { id: user.id, email: user.email, displayName: user.display_name } });
+});
+
+import express from "express";
+import { z } from "zod";
+import { query } from "../db.js";
+import { authRequired } from "../middleware/auth.js";
+import { validate } from "../middleware/validate.js";
+import { roundCoord, toPointWKT } from "../utils/geo.js";
+export const soemiaRouter = express.Router();
+soemiaRouter.get("/me", authRequired, async (req, res) => {
+const r = await query(
+"SELECT id,email,display_name,location_consent,location_visibility FROM soemia WHERE id=$1",
+[req.user.sub]
+);
+});
+return res.json({ user: r.rows[0] });
+const settingsSchema = z.object({
+body: z.object({
+locationConsent: z.boolean(),
+locationVisibility: z.enum(["off", "city", "province", "radius"]),
+lat: z.number().optional(),
+lng: z.number().optional()
+})
+});
+soemiaRouter.put("/me/settings", authRequired, validate(settingsSchema), async (req, res) => {
+const { locationConsent, locationVisibility, lat, lng } = req.validated.body;
+if (!locationConsent || locationVisibility === "off") {
+await query(
+"UPDATE soemia SET location_consent=false, location_visibility='off', approx_location=NULL, approx_lo
+[req.user.sub]
+);
+return res.json({ ok: true });
+}
+if (typeof lat !== "number" || typeof lng !== "number") {
+return res.status(400).json({ error: "lat/lng richiesti se il consenso è attivo" });
+}
+const latR = roundCoord(lat, 2);
+const lngR = roundCoord(lng, 2);
+const wkt = toPointWKT(latR, lngR);
+await query(
+"UPDATE soemia SET location_consent=true, location_visibility=$1, approx_location=ST_GeogFromText($2),
+[locationVisibility, wkt, req.user.sub]
+);
+return res.json({ ok: true });
+});
+import express from "express";
+import path from "path";
+import fs from "fs";
+import multer from "multer";
+import { z } from "zod";
+import PDFDocument from "pdfkit";import { query } from "../db.js";
+import { authRequired } from "../middleware/auth.js";
+import { authOptional } from "../middleware/authOptional.js";
+import { validate } from "../middleware/validate.js";
+import { makeThumbnail } from "../utils/image.js";
+import { canSeeFull, toLightBook } from "../utils/visibility.js";
+export const booksRouter = express.Router();
+const uploadDir = process.env.UPLOAD_DIR || "./src/uploads";
+fs.mkdirSync(uploadDir, { recursive: true });
+const storage = multer.diskStorage({
+destination: (_req, _file, cb) => cb(null, uploadDir),
+filename: (_req, file, cb) => {
+const safe = `${Date.now()}-${file.originalname}`.replace(/[^a-zA-Z0-9._-]/g, "_");
+cb(null, safe);
+}
+});
+const upload = multer({ storage });
+function isOwner(bookOwnerId, userId) {
+return Boolean(userId) && String(bookOwnerId) === String(userId);
+}
+/** CREATE */
+const createSchema = z.object({
+body: z.object({
+title: z.string().min(1),
+author: z.string().min(1),
+isbn: z.string().optional(),
+language: z.string().optional(),
+year: z.number().int().optional(),
+tags: z.array(z.string()).optional(),
+visibility: z.enum(["public", "registered", "request"]).default("public"),
+lendable: z.boolean().default(false)
+})
+});
+booksRouter.post("/", authRequired, validate(createSchema), async (req, res) => {
+const b = req.validated.body;
+const r = await query(
+`INSERT INTO books(owner_id,title,author,isbn,language,year,tags,visibility,lendable)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+RETURNING *`,
+[
+req.user.sub,
+b.title,
+b.author,
+b.isbn || null,
+b.language || null,
+b.year || null,
+b.tags || [],
+b.visibility,
+b.lendable
+]
+);
+await query("INSERT INTO book_metrics(book_id) VALUES ($1) ON CONFLICT DO NOTHING", [r.rows[0].id]);
+return res.json({ book: r.rows[0] });
+});
+/** UPDATE (solo owner) */
+const updateSchema = z.object({
+body: z.object({
+title: z.string().min(1).optional(),
+author: z.string().min(1).optional(),
+isbn: z.string().optional(),
+language: z.string().optional(),
+year: z.number().int().optional(),
+tags: z.array(z.string()).optional(),
+visibility: z.enum(["public", "registered", "request"]).optional(),
+lendable: z.boolean().optional()
+})
+});
+booksRouter.put("/:id", authRequired, validate(updateSchema), async (req, res) => {
+const id = req.params.id;
+const existing = await query("SELECT * FROM books WHERE id=$1", [id]);
+if (existing.rowCount === 0) return res.status(404).json({ error: "Not found" });const book = existing.rows[0];
+if (!isOwner(book.owner_id, req.user.sub)) return res.status(403).json({ error: "Non autorizzato" });
+const b = req.validated.body;
+const newVal = {
+title: b.title ?? book.title,
+author: b.author ?? book.author,
+isbn: b.isbn ?? book.isbn,
+language: b.language ?? book.language,
+year: b.year ?? book.year,
+tags: b.tags ?? book.tags,
+visibility: b.visibility ?? book.visibility,
+lendable: b.lendable ?? book.lendable
+};
+const r = await query(
+`UPDATE books
+WHERE id=$9
+RETURNING *`,
+SET title=$1, author=$2, isbn=$3, language=$4, year=$5, tags=$6, visibility=$7, lendable=$8, updated_
+[
+newVal.title,
+newVal.author,
+newVal.isbn || null,
+newVal.language || null,
+newVal.year || null,
+newVal.tags || [],
+newVal.visibility,
+newVal.lendable,
+id
+]
+);
+return res.json({ book: r.rows[0] });
+});
+/** DELETE (solo owner) */
+booksRouter.delete("/:id", authRequired, async (req, res) => {
+const id = req.params.id;
+const existing = await query("SELECT owner_id FROM books WHERE id=$1", [id]);
+if (existing.rowCount === 0) return res.status(404).json({ error: "Not found" });
+if (!isOwner(existing.rows[0].owner_id, req.user.sub)) return res.status(403).json({ error: "Non autoriz
+await query("DELETE FROM books WHERE id=$1", [id]);
+return res.json({ ok: true });
+});
+/** UPLOAD cover (solo owner) */
+booksRouter.post("/:id/cover", authRequired, upload.single("cover"), async (req, res) => {
+const bookId = req.params.id;
+const file = req.file;
+if (!file) return res.status(400).json({ error: "File mancante" });
+const own = await query("SELECT id FROM books WHERE id=$1 AND owner_id=$2", [bookId, req.user.sub]);
+if (own.rowCount === 0) return res.status(403).json({ error: "Non autorizzato" });
+const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:8080";
+const coverUrl = `${baseUrl}/uploads/${file.filename}`;
+const thumbName = `thumb-${file.filename}.jpg`;
+const thumbPath = path.join(uploadDir, thumbName);
+await makeThumbnail(file.path, thumbPath);
+const coverThumbUrl = `${baseUrl}/uploads/${thumbName}`;
+await query(
+"UPDATE books SET cover_url=$1, cover_thumb_url=$2, updated_at=now() WHERE id=$3",
+[coverUrl, coverThumbUrl, bookId]
+);
+return res.json({ coverUrl, coverThumbUrl });
+});
+/** SEARCH LIST — sempre LIGHT */
+const searchSchema = z.object({
+query: z.object({
+q: z.string().optional(),
+maxKm: z.string().optional(),
+lat: z.string().optional(),
+lng: z.string().optional(),
+lendable: z.string().optional(),visibility: z.string().optional(),
+sort: z.string().optional()
+})
+});
+booksRouter.get("/", validate(searchSchema), async (req, res) => {
+const { q, maxKm, lat, lng, lendable, visibility, sort } = req.validated.query;
+const params = [];
+let where = "WHERE 1=1";
+if (q && q.trim()) {
+params.push(q.trim());
+where += ` AND to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(author,'') || ' ' || coales
+}
+if (lendable === "true" || lendable === "false") {
+params.push(lendable === "true");
+where += ` AND lendable = $${params.length}`;
+}
+if (visibility === "public" || visibility === "registered" || visibility === "request") {
+params.push(visibility);
+where += ` AND b.visibility = $${params.length}`;
+}
+let distanceSelect = "NULL::double precision AS distance_km";
+let distanceWhere = "";
+if (lat && lng && maxKm) {
+const latN = Number(lat), lngN = Number(lng), kmN = Number(maxKm);
+if (Number.isFinite(latN) && Number.isFinite(lngN) && Number.isFinite(kmN)) {
+params.push(lngN, latN, kmN * 1000);
+distanceSelect = `ST_Distance(u.approx_location, ST_SetSRID(ST_MakePoint($${params.length-2}, $${par
+distanceWhere = ` AND u.location_consent=true AND u.location_visibility<>'off' AND u.approx_location
+AND ST_DWithin(u.approx_location, ST_SetSRID(ST_MakePoint($${params.length-2}, $$
+}
+}
+let orderBy = "ORDER BY b.created_at DESC";
+if (sort === "views") orderBy = "ORDER BY COALESCE(m.views,0) DESC, b.created_at DESC";
+if (sort === "distance") orderBy = "ORDER BY (distance_km IS NULL), distance_km ASC, b.created_at DESC"
+if (sort === "relevance" && q && q.trim()) {
+orderBy = `ORDER BY ts_rank(to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(author,'') ||
+}
+const sql = `
+SELECT b.*, ${distanceSelect},
+COALESCE(m.views,0) AS views,
+COALESCE(m.detail_opens,0) AS detail_opens,
+COALESCE(m.downloads,0) AS downloads,
+COALESCE(m.exports,0) AS exports,
+COALESCE(m.loan_requests,0) AS loan_requests
+FROM books b
+JOIN soemia u ON u.id=b.owner_id
+LEFT JOIN book_metrics m ON m.book_id=b.id
+${where}
+${distanceWhere}
+${orderBy}
+LIMIT 50;
+`;
+const r = await query(sql, params);
+return res.json({ books: r.rows.map(toLightBook) });
+});
+/** DETAIL — FULL/LIGHT con permessi + increment detail_opens */
+booksRouter.get("/:id", authOptional, async (req, res) => {
+const id = req.params.id;
+const r = await query(
+`SELECT b.*, COALESCE(m.views,0) AS views,
+COALESCE(m.detail_opens,0) AS detail_opens,
+COALESCE(m.downloads,0) AS downloads,
+COALESCE(m.exports,0) AS exports,
+COALESCE(m.loan_requests,0) AS loan_requests
+FROM books b
+LEFT JOIN book_metrics m ON m.book_id=b.id
+WHERE b.id=$1`,
+[id]
+);
+if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });const book = r.rows[0];
+const isLogged = Boolean(req.user?.sub);
+const owner = isOwner(book.owner_id, req.user?.sub);
+await query("UPDATE book_metrics SET detail_opens=detail_opens+1, updated_at=now() WHERE book_id=$1", [i
+const full = owner || canSeeFull(book.visibility, isLogged);
+if (!full) {
+return res.json({
+detailLevel: "light",
+book: toLightBook(book),
+hint:
+book.visibility === "registered"
+? "Effettua il login per vedere i dettagli completi."
+: "Questo libro è “su richiesta”: invia una richiesta contatto per procedere."
+});
+}
+return res.json({ detailLevel: "full", book });
+});
+/** EVENTO DOWNLOAD (metriche) */
+booksRouter.post("/:id/download", authOptional, async (req, res) => {
+const id = req.params.id;
+const r = await query("SELECT id FROM books WHERE id=$1", [id]);
+if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });
+await query("UPDATE book_metrics SET downloads=downloads+1, updated_at=now() WHERE book_id=$1", [id]);
+return res.json({ ok: true });
+});
+/** EXPORT JSON (rispetta permessi) */
+booksRouter.get("/:id/export.json", authOptional, async (req, res) => {
+const id = req.params.id;
+const r = await query(
+`SELECT b.*, COALESCE(m.views,0) AS views,
+COALESCE(m.detail_opens,0) AS detail_opens,
+COALESCE(m.downloads,0) AS downloads,
+COALESCE(m.exports,0) AS exports,
+COALESCE(m.loan_requests,0) AS loan_requests
+FROM books b
+LEFT JOIN book_metrics m ON m.book_id=b.id
+WHERE b.id=$1`,
+[id]
+);
+if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });
+const book = r.rows[0];
+const isLogged = Boolean(req.user?.sub);
+const owner = isOwner(book.owner_id, req.user?.sub);
+const full = owner || canSeeFull(book.visibility, isLogged);
+await query("UPDATE book_metrics SET exports=exports+1, updated_at=now() WHERE book_id=$1", [id]);
+const payload = full ? book : toLightBook(book);
+res.setHeader("Content-Type", "application/json");
+return res.send(JSON.stringify(payload, null, 2));
+});
+/** EXPORT PDF */
+booksRouter.get("/:id/export.pdf", authOptional, async (req, res) => {
+const id = req.params.id;
+const r = await query(
+`SELECT b.*, COALESCE(m.views,0) AS views,
+COALESCE(m.detail_opens,0) AS detail_opens,
+COALESCE(m.downloads,0) AS downloads,
+COALESCE(m.exports,0) AS exports,
+COALESCE(m.loan_requests,0) AS loan_requests
+FROM books b
+LEFT JOIN book_metrics m ON m.book_id=b.id
+WHERE b.id=$1`,
+[id]
+);
+if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });
+const book = r.rows[0];
+const isLogged = Boolean(req.user?.sub);const owner = isOwner(book.owner_id, req.user?.sub);
+const full = owner || canSeeFull(book.visibility, isLogged);
+await query("UPDATE book_metrics SET exports=exports+1, updated_at=now() WHERE book_id=$1", [id]);
+const payload = full ? book : toLightBook(book);
+res.setHeader("Content-Type", "application/pdf");
+res.setHeader("Content-Disposition", `attachment; filename="book-${id}.pdf"`);
+const doc = new PDFDocument({ margin: 50 });
+doc.pipe(res);
+doc.fontSize(20).text(payload.title || "Scheda libro", { underline: true });
+doc.moveDown();
+doc.fontSize(12).text(`Autore: ${payload.author || "—"}`);
+if (full) {
+doc.text(`ISBN: ${payload.isbn || "—"}`);
+doc.text(`Lingua: ${payload.language || "—"}`);
+doc.text(`Anno: ${payload.year || "—"}`);
+doc.text(`Prestabile: ${payload.lendable ? "Sì" : "No"}`);
+}
+doc.text(`Visibilità: ${payload.visibility || "—"}`);
+doc.moveDown();
+doc.text(`Tag: ${(payload.tags || []).join(", ") || "—"}`);
+doc.moveDown();
+doc.fontSize(10).text(
+`Metriche: views=${payload.views ?? 0}, detail_opens=${payload.detail_opens ?? 0}, downloads=${payload
+);
+doc.end();
+});
+
+import express from "express";
+import { z } from "zod";
+import { query } from "../db.js";
+import { authRequired } from "../middleware/auth.js";
+import { validate } from "../middleware/validate.js";
+export const loansRouter = express.Router();
+const requestSchema = z.object({
+body: z.object({
+bookId: z.string().uuid(),
+message: z.string().max(500).optional()
+})
+});
+loansRouter.post("/request", authRequired, validate(requestSchema), async (req, res) => {
+const { bookId, message } = req.validated.body;
+const b = await query("SELECT owner_id FROM books WHERE id=$1", [bookId]);
+if (b.rowCount === 0) return res.status(404).json({ error: "Libro non trovato" });
+if (b.rows[0].owner_id === req.user.sub) return res.status(400).json({ error: "Non puoi richiedere il tu
+const r = await query(
+"INSERT INTO loan_requests(book_id, requester_id, message) VALUES ($1,$2,$3) RETURNING *",
+[bookId, req.user.sub, message || null]
+);
+await query("UPDATE book_metrics SET loan_requests=loan_requests+1, updated_at=now() WHERE book_id=$1",
+return res.json({ request: r.rows[0] });
+});
+loansRouter.get("/inbox", authRequired, async (req, res) => {
+const sql = `
+SELECT lr.id, lr.status, lr.created_at, lr.message,
+b.id AS book_id, b.title, b.author,
+u.id AS requester_id, u.display_name, u.email
+FROM loan_requests lr
+JOIN books b ON b.id = lr.book_id
+JOIN soemia u ON u.id = lr.requester_id
+WHERE b.owner_id = $1
+ORDER BY lr.created_at DESC
+LIMIT 100;
+`;const r = await query(sql, [req.user.sub]);
+return res.json({ items: r.rows });
+});
+const statusSchema = z.object({
+body: z.object({
+status: z.enum(["accepted", "rejected", "cancelled"])
+})
+});
+loansRouter.put("/:id/status", authRequired, validate(statusSchema), async (req, res) => {
+const id = req.params.id;
+const { status } = req.validated.body;
+const r = await query(
+`SELECT lr.id, lr.book_id, b.owner_id
+FROM loan_requests lr
+JOIN books b ON b.id = lr.book_id
+WHERE lr.id = $1`,
+[id]
+);
+if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });
+if (r.rows[0].owner_id !== req.user.sub) return res.status(403).json({ error: "Non autorizzato" });
+const upd = await query(
+"UPDATE loan_requests SET status=$1 WHERE id=$2 RETURNING *",
+[status, id]
+);
+});
+return res.json({ request: upd.rows[0] });
+import express from "express";
+import { query } from "../db.js";
+import { authRequired } from "../middleware/auth.js";
+export const metricsRouter = express.Router();
+metricsRouter.get("/me", authRequired, async (req, res) => {
+const sql = `
+SELECT b.id, b.title,
+COALESCE(m.views,0) AS views,
+COALESCE(m.detail_opens,0) AS detail_opens,
+COALESCE(m.downloads,0) AS downloads,
+COALESCE(m.exports,0) AS exports,
+COALESCE(m.loan_requests,0) AS loan_requests
+FROM books b
+LEFT JOIN book_metrics m ON m.book_id=b.id
+WHERE b.owner_id=$1
+ORDER BY COALESCE(m.detail_opens,0) DESC, b.created_at DESC;
+`;
+});
+const r = await query(sql, [req.user.sub]);
+return res.json({ items: r.rows });
+metricsRouter.get("/me/summary", authRequired, async (req, res) => {
+const sql = `
+SELECT
+COUNT(*)::int AS books,
+SUM(COALESCE(m.views,0))::bigint AS views,
+SUM(COALESCE(m.detail_opens,0))::bigint AS detail_opens,
+SUM(COALESCE(m.downloads,0))::bigint AS downloads,
+SUM(COALESCE(m.exports,0))::bigint AS exports,
+SUM(COALESCE(m.loan_requests,0))::bigint AS loan_requests
+FROM books b
+LEFT JOIN book_metrics m ON m.book_id=b.id
+WHERE b.owner_id=$1;
+`;
+});
+const r = await query(sql, [req.user.sub]);
+return res.json({ summary: r.rows[0] });
+import express from "express";import cors from "cors";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { limiter } from "./middleware/rateLimit.js";
+import { authRouter } from "./routes/auth.js";
+import { soemiaRouter } from "./routes/soemia.js";
+import { booksRouter } from "./routes/books.js";
+import { loansRouter } from "./routes/loans.js";
+import { metricsRouter } from "./routes/metrics.js";
+dotenv.config();
+const app = express();
+app.use(limiter);
+app.use(cors({ origin: process.env.CORS_ORIGIN, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.use("/auth", authRouter);
+app.use("/soemia", soemiaRouter);
+app.use("/books", booksRouter);
+app.use("/loans", loansRouter);
+app.use("/metrics", metricsRouter);
+const port = Number(process.env.PORT || 8080);
+app.listen(port, () => console.log(`API on http://localhost:${port}`));
+{
+"name": "private-library-frontend",
+"private": true,
+"type": "module",
+"scripts": { "dev": "vite" },
+"dependencies": {
+"react": "^18.3.1",
+"react-dom": "^18.3.1",
+"react-router-dom": "^6.26.2"
+},
+"devDependencies": {
+"@vitejs/plugin-react": "^4.3.1",
+"vite": "^5.4.2"
+}
+}
+
+const API = "http://localhost:8080";
+export function setToken(token) {
+localStorage.setItem("token", token);
+}
+export function getToken() {
+return localStorage.getItem("token");
+}
+export function clearToken() {
+localStorage.removeItem("token");
+}
+export async function api(path, { method="GET", body, isForm=false } = {}) {
+const headers = {};
+const token = getToken();
+if (token) headers.Authorization = `Bearer ${token}`;
+let payload = undefined;
+if (body !== undefined) {
+if (isForm) payload = body;
+else {
+headers["Content-Type"] = "application/json";
+payload = JSON.stringify(body);
+}
+}
+const res = await fetch(`${API}${path}`, { method, headers, body: payload });
+const data = await res.json().catch(() => ({}));
+if (!res.ok) throw new Error(data?.error || "Errore richiesta");
+return data;
+}
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./app.jsx";
+import "./styles.css";
+ReactDOM.createRoot(document.getElementById("root")).render(
+<React.StrictMode>
+<App />
+</React.StrictMode>
+);
+
+import { BrowserRouter, Routes, Route, Link, Navigate, useNavigate } from "react-router-dom";
+import { clearToken, getToken } from "./api.js";import Search from "./pages/Search.jsx";
+import Login from "./pages/Login.jsx";
+import Register from "./pages/Register.jsx";
+import Publish from "./pages/Publish.jsx";
+import Dashboard from "./pages/Dashboard.jsx";
+import Settings from "./pages/Settings.jsx";
+import Book from "./pages/Book.jsx";
+function Nav() {
+const nav = useNavigate();
+const logged = Boolean(getToken());
+function logout() {
+clearToken();
+nav("/");
+}
+return (
+<header className="topbar">
+<nav className="container row" aria-label="Navigazione principale">
+<Link to="/">Cerca</Link>
+{logged ? (
+<>
+<Link to="/publish">Pubblica</Link>
+<Link to="/dashboard">Dashboard</Link>
+<Link to="/settings">Privacy</Link>
+<button type="button" onClick={logout}>Logout</button>
+</>
+) : (
+<>
+<Link to="/login">Login</Link>
+<Link to="/register">Registrati</Link>
+</>
+)}
+</nav>
+</header>
+);
+function RequireAuth({ children }) {
+return getToken() ? children : <Navigate to="/login" replace />;
+}
+}
+export default function App() {
+return (
+<BrowserRouter>
+<Nav />
+<Routes>
+<Route path="/" element={<Search />} />
+<Route path="/book/:id" element={<Book />} />
+<Route path="/login" element={<Login />} />
+<Route path="/register" element={<Register />} />
+<Route path="/publish" element={<RequireAuth><Publish /></RequireAuth>} />
+<Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
+<Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
+</Routes>
+</BrowserRouter>
+);
+}
+
+import { useEffect, useState } from "react";
+import { api } from "../api.js";
+import BookCard from "../components/BookCard.jsx";
+export default function Search() {
+const [q, setQ] = useState("");
+const [lendable, setLendable] = useState(false);
+const [maxKm, setMaxKm] = useState(10);
+const [geoOn, setGeoOn] = useState(false);
+const [pos, setPos] = useState(null);
+const [sort, setSort] = useState("distance");
+const [items, setItems] = useState([]);
+const [err, setErr] = useState("");
+async function load() {setErr("");
+const params = new URLSearchParams();
+if (q.trim()) params.set("q", q.trim());
+params.set("lendable", String(lendable));
+params.set("sort", sort);
+if (geoOn && pos) {
+params.set("lat", String(pos.lat));
+params.set("lng", String(pos.lng));
+params.set("maxKm", String(maxKm));
+}
+try {
+const data = await api(`/books?${params.toString()}`);
+setItems(data.books);
+} catch (e) {
+setErr(e.message);
+}
+}
+useEffect(() => { load(); }, []);
+useEffect(() => { load(); }, [lendable, sort, geoOn, pos, maxKm]);
+function enableGeo() {
+setErr("");
+if (!navigator.geolocation) return setErr("Geolocalizzazione non supportata.");
+navigator.geolocation.getCurrentPosition(
+(p) => {
+setPos({ lat: p.coords.latitude, lng: p.coords.longitude });
+setGeoOn(true);
+},
+() => setErr("Permesso negato o posizione non disponibile.")
+);
+}
+return (
+<main id="main" className="container">
+<h1>Ricerca libri</h1>
+<form className="panel" onSubmit={(e) => { e.preventDefault(); load(); }} aria-label="Filtri ricerca
+<label>
+Cerca (titolo/autore/ISBN)
+<input value={q} onChange={(e) => setQ(e.target.value)} />
+</label>
+<label className="row">
+<input type="checkbox" checked={lendable} onChange={(e) => setLendable(e.target.checked)} />
+Solo prestabili
+</label>
+<label>
+Ordina per
+<select value={sort} onChange={(e) => setSort(e.target.value)}>
+<option value="distance">Distanza</option>
+<option value="views">Più visti</option>
+<option value="relevance">Rilevanza</option>
+</select>
+</label>
+<div className="row">
+<button type="button" onClick={enableGeo}>Attiva “vicino a me”</button>
+<label>
+Raggio (km)
+<input type="number" min="1" max="200" value={maxKm} onChange={(e) => setMaxKm(Number(e.target
+</label>
+<button type="submit">Cerca</button>
+</div>
+{err && <p role="alert" className="error">{err}</p>}
+</form>
+<section aria-label="Risultati">
+{items.map((b) => <BookCard key={b.id} book={b} />)}
+{items.length === 0 && <p>Nessun risultato.</p>}
+</section>
+</main>
+);
+}
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { api } from "../api.js";
+export default function Book() {
+const { id } = useParams();
+const [data, setData] = useState(null);
+const [err, setErr] = useState("");
+async function load() {
+setErr("");
+try {
+const d = await api(`/books/${id}`);
+setData(d);
+} catch (e) {
+setErr(e.message);
+}
+}
+useEffect(() => { load(); }, [id]);
+async function requestContact() {
+try {
+await api("/loans/request", { method: "POST", body: { bookId: id, message: "Ciao! Vorrei mettermi in
+alert("Richiesta inviata!");
+await load();
+} catch (e) {
+alert(e.message);
+}
+}
+async function trackDownload() {
+try {
+await api(`/books/${id}/download`, { method: "POST" });
+alert("Download registrato (evento).");
+await load();
+} catch (e) {
+alert(e.message);
+}
+}
+if (err) return <main className="container"><p role="alert" className="error">{err}</p></main>;
+if (!data) return <main className="container"><p>Caricamento…</p></main>;
+const { detailLevel, book, hint } = data;
+const thumb = book.cover_url || book.cover_thumb_url;
+return (
+<main id="main" className="container">
+<h1>{book.title}</h1>
+<p className="muted">{book.author}</p>
+{thumb && <img src={thumb} alt={`Copertina di ${book.title}`} style={{ maxWidth: 240, borderRadius:
+{hint && <p className="panel" role="note">{hint}</p>}
+<div className="panel">
+<p><strong>Visibilità:</strong> {book.visibility}</p>
+{detailLevel === "full" ? (
+<>
+<p><strong>ISBN:</strong> {book.isbn ?? "—"}</p>
+<p><strong>Lingua:</strong> {book.language ?? "—"}</p>
+<p><strong>Anno:</strong> {book.year ?? "—"}</p>
+<p><strong>Prestabile:</strong> {book.lendable ? "Sì" : "No"}</p>
+</>
+) : (
+<p className="muted">Dettagli limitati.</p>
+)}
+<p className="muted">
+</p>
+Metriche: views={book.views ?? 0}, detail_opens={book.detail_opens ?? 0}, downloads={book.downlo
+<div className="row">
+{book.visibility === "request" && detailLevel === "light" && (
+<button onClick={requestContact}>Richiedi contatto</button>
+)}<button onClick={trackDownload}>Simula download (evento)</button>
+<a className="btnlink" href={`http://localhost:8080/books/${id}/export.json`} target="_blank" re
+Export JSON
+</a>
+Export PDF
+</a>
+</div>
+</div>
+</main>
+<a className="btnlink" href={`http://localhost:8080/books/${id}/export.pdf`} target="_blank" rel
+);
+}
+
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { api, setToken } from "../api.js";
+export default function Login() {
+const nav = useNavigate();
+const [email, setEmail] = useState("");
+const [password, setPassword] = useState("");
+const [err, setErr] = useState("");
+async function submit(e) {
+e.preventDefault();
+setErr("");
+try {
+const data = await api("/auth/login", { method: "POST", body: { email, password } });
+setToken(data.token);
+nav("/");
+} catch (e2) {
+setErr(e2.message);
+}
+}
+return (
+<main id="main" className="container">
+<h1>Login</h1>
+<form className="panel" onSubmit={submit}>
+<label>Email<input value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" /
+<label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value
+{err && <p role="alert" className="error">{err}</p>}
+<button type="submit">Entra</button>
+</form>
+</main>
+);
+}
+
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { api } from "../api.js";
+export default function Register() {
+const nav = useNavigate();
+const [displayName, setDisplayName] = useState("");
+const [email, setEmail] = useState("");
+const [password, setPassword] = useState("");
+const [err, setErr] = useState("");
+async function submit(e) {
+e.preventDefault();
+setErr("");
+try {
+nav("/login");
+} catch (e2) {
+setErr(e2.message);
+await api("/auth/register", { method: "POST", body: { email, password, displayName } });
+}
+}
+return (<main id="main" className="container">
+<h1>Registrati</h1>
+<form className="panel" onSubmit={submit}>
+<label>Nome pubblico<input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+<label>Email<input value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" /
+<label>Password (min 8)<input type="password" value={password} onChange={(e) => setPassword(e.targ
+{err && <p role="alert" className="error">{err}</p>}
+<button type="submit">Crea account</button>
+</form>
+</main>
+);
+}
+
+import { useState } from "react";
+import { api } from "../api.js";
+import { useNavigate } from "react-router-dom";
+export default function Publish() {
+const nav = useNavigate();
+const [title, setTitle] = useState("");
+const [author, setAuthor] = useState("");
+const [isbn, setIsbn] = useState("");
+const [language, setLanguage] = useState("it");
+const [year, setYear] = useState("");
+const [tags, setTags] = useState("");
+const [visibility, setVisibility] = useState("public");
+const [lendable, setLendable] = useState(false);
+const [cover, setCover] = useState(null);
+const [err, setErr] = useState("");
+async function submit(e) {
+e.preventDefault();
+setErr("");
+try {
+const payload = {
+title,
+author,
+isbn: isbn || undefined,
+language: language || undefined,
+year: year ? Number(year) : undefined,
+tags: tags ? tags.split(",").map(s => s.trim()).filter(Boolean) : undefined,
+visibility,
+lendable
+};
+const created = await api("/books", { method: "POST", body: payload });
+const bookId = created.book.id;
+if (cover) {
+const form = new FormData();
+form.append("cover", cover);
+await api(`/books/${bookId}/cover`, { method: "POST", body: form, isForm: true });
+}
+nav(`/book/${bookId}`);
+} catch (e2) {
+setErr(e2.message);
+}
+}
+return (
+<main id="main" className="container">
+<h1>Pubblica un libro</h1>
+<form className="panel" onSubmit={submit}>
+<label>Titolo<input value={title} onChange={(e)=>setTitle(e.target.value)} /></label>
+<label>Autore<input value={author} onChange={(e)=>setAuthor(e.target.value)} /></label>
+<label>ISBN<input value={isbn} onChange={(e)=>setIsbn(e.target.value)} /></label>
+<label>Lingua<input value={language} onChange={(e)=>setLanguage(e.target.value)} /></label>
+<label>Anno<input value={year} onChange={(e)=>setYear(e.target.value)} inputMode="numeric" /></lab
+<label>Tag (comma-separated)<input value={tags} onChange={(e)=>setTags(e.target.value)} /></label>
+<label>
+Visibilità
+<select value={visibility} onChange={(e)=>setVisibility(e.target.value)}>
+<option value="public">public</option>
+<option value="registered">registered</option><option value="request">request</option>
+</select>
+</label>
+<label className="row">
+<input type="checkbox" checked={lendable} onChange={(e)=>setLendable(e.target.checked)} />
+Disponibile al prestito
+</label>
+<label>
+Copertina
+</label>
+<input type="file" accept="image/*" onChange={(e)=>setCover(e.target.files?.[0] || null)} />
+{err && <p role="alert" className="error">{err}</p>}
+<button type="submit">Pubblica</button>
+</form>
+</main>
+);
+}
+
+import { useEffect, useState } from "react";
+import { api } from "../api.js";
+export default function Dashboard() {
+const [summary, setSummary] = useState(null);
+const [items, setItems] = useState([]);
+const [inbox, setInbox] = useState([]);
+const [err, setErr] = useState("");
+async function load() {
+setErr("");
+try {
+const s = await api("/metrics/me/summary");
+const m = await api("/metrics/me");
+const i = await api("/loans/inbox");
+setSummary(s.summary);
+setItems(m.items);
+setInbox(i.items);
+} catch (e) {
+setErr(e.message);
+}
+}
+useEffect(() => { load(); }, []);
+async function setStatus(reqId, status) {
+try {
+await load();
+} catch (e) {
+alert(e.message);
+await api(`/loans/${reqId}/status`, { method: "PUT", body: { status } });
+}
+}
+return (
+<main id="main" className="container">
+<h1>Dashboard</h1>
+{err && <p role="alert" className="error">{err}</p>}
+{summary && (
+<section className="panel" aria-label="Riepilogo">
+<h2>Riepilogo</h2>
+<p>Libri: {summary.books}</p>
+<p>Views: {summary.views} · Dettagli: {summary.detail_opens} · Download: {summary.downloads} · E
+</section>
+)}
+<section className="panel" aria-label="Metriche per libro">
+<h2>Metriche per libro</h2>
+{items.map((x) => (
+<div key={x.id} className="card">
+<div className="card-body">
+<h3 className="card-title">{x.title}</h3>
+<p className="muted">Views {x.views} · Dettagli {x.detail_opens} · Download {x.downloads} ·
+</div>
+</div>))}
+</section>
+{items.length === 0 && <p>Nessun libro pubblicato.</p>}
+<section className="panel" aria-label="Richieste contatto ricevute">
+<h2>Richieste contatto</h2>
+{inbox.map((r) => (
+<div key={r.id} className="card">
+<div className="card-body">
+<h3 className="card-title">{r.title} — {r.author}</h3>
+<p className="muted">Da: {r.display_name} ({r.email}) · Stato: {r.status}</p>
+<p>{r.message || "—"}</p>
+<div className="row">
+<button onClick={() => setStatus(r.id, "accepted")}>Accetta</button>
+<button onClick={() => setStatus(r.id, "rejected")}>Rifiuta</button>
+<button onClick={() => setStatus(r.id, "cancelled")}>Archivia</button>
+</div>
+</div>
+</div>
+))}
+</section>
+</main>
+{inbox.length === 0 && <p>Nessuna richiesta.</p>}
+);
+}
+
+import { useEffect, useState } from "react";
+import { api } from "../api.js";
+export default function Settings() {
+const [consent, setConsent] = useState(false);
+const [visibility, setVisibility] = useState("off");
+const [err, setErr] = useState("");
+const [ok, setOk] = useState("");
+async function load() {
+setErr("");
+try {
+const me = await api("/soemia/me");
+setConsent(me.user.location_consent);
+setVisibility(me.user.location_visibility);
+} catch (e) {
+setErr(e.message);
+}
+}
+useEffect(() => { load(); }, []);
+async function save() {
+setErr("");
+setOk("");
+try {
+if (!consent || visibility === "off") {
+await api("/soemia/me/settings", { method: "PUT", body: { locationConsent: false, locationVisibilit
+setOk("Impostazioni salvate.");
+return;
+}
+if (!navigator.geolocation) throw new Error("Geolocalizzazione non supportata dal browser.");
+navigator.geolocation.getCurrentPosition(
+async (p) => {
+await api("/soemia/me/settings", {
+method: "PUT",
+body: {
+locationConsent: true,
+locationVisibility: visibility,
+lat: p.coords.latitude,
+lng: p.coords.longitude
+}
+});
+setOk("Posizione salvata (approssimata) e impostazioni aggiornate.");
+},
+() => setErr("Permesso negato o posizione non disponibile.")
+);
+} catch (e) {
+setErr(e.message);}
+}
+return (
+<main id="main" className="container">
+<h1>Privacy & Posizione</h1>
+<section className="panel">
+<label className="row">
+<input type="checkbox" checked={consent} onChange={(e)=>setConsent(e.target.checked)} />
+Consento l’uso della posizione (approssimata)
+</label>
+<label>
+Visibilità posizione
+<select value={visibility} onChange={(e)=>setVisibility(e.target.value)}>
+<option value="off">off</option>
+<option value="city">city</option>
+<option value="province">province</option>
+<option value="radius">radius</option>
+</select>
+</label>
+<button onClick={save}>Salva</button>
+{ok && <p role="status">{ok}</p>}
+{err && <p role="alert" className="error">{err}</p>}
+</section>
+<p className="muted">
+Nota: la posizione viene salvata in modo approssimato (privacy), e puoi revocare il consenso in qu
+</p>
+</main>
+);
+}
+
+import { Link } from "react-router-dom";
+export default function BookCard({ book }) {
+const thumb = book.cover_thumb_url || book.cover_url;
+const visibilityLabel =
+book.visibility === "public" ? "Pubblico" :
+book.visibility === "registered" ? "Solo registrati" :
+"Su richiesta";
+return (
+<article className="card">
+<div className="card-media" aria-hidden="true">
+{thumb ? <img src={thumb} alt="" /> : <div className="placeholder">Nessuna copertina</div>}
+</div>
+<div className="card-body">
+<h2 className="card-title">
+<Link to={`/book/${book.id}`}>{book.title}</Link>
+</h2>
+<p className="muted">{book.author}</p>
+<p className="muted">Visibilità: {visibilityLabel}</p>
+<p className="muted">
+{book.distance_km != null ? `Distanza: ${book.distance_km.toFixed(1)} km` : "Distanza: —"}
+</p>
+<p className="muted">
+Views: {book.views ?? 0} · Download: {book.downloads ?? 0} · Richieste: {book.loan_requests ?? 0
+</p>
+</div>
+</article>
+);
+}
+
+:root { font-family: system-ui, sans-serif; }
+.container { max-width: 920px; margin: 0 auto; padding: 16px; }
+.panel { padding: 12px; border: 1px solid #ddd; border-radius: 10px; margin-bottom: 16px; }.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.card { display: flex; gap: 12px; border: 1px solid #eee; border-radius: 12px; padding: 12px; margin: 12px
+.card-media img { width: 90px; height: 120px; object-fit: cover; border-radius: 8px; }
+.placeholder { width: 90px; height: 120px; display:flex; align-items:center; justify-content:center; borde
+.card-title { margin: 0; font-size: 18px; }
+.card-body { flex: 1; }
+.muted { color: #555; }
+.error { color: #b00020; }
+.topbar { border-bottom: 1px solid #eee; background: #fafafa; }
+.topbar a { text-decoration: none; }
+.topbar button { padding: 6px 10px; }
+.btnlink { display: inline-block; padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; text-dec
+button:focus, input:focus, select:focus, a:focus { outline: 3px solid; outline-offset: 2px; }
